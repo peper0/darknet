@@ -73,6 +73,14 @@ void resize_region_layer(layer *l, int w, int h)
 #endif
 }
 
+/// Obtain box from the (tx, tx, tw, th, ...) format. Unit is image size.
+/// @param x - last cnn layer output data
+/// @param biases - anchor boxes sizes (w0, h0, w1, h1, ...)
+/// @param n selected achnor box index
+/// @param index address of bucket in the "x" array (includes cell, batch, anchor)
+/// @param i horizontal coordinate of the cell
+/// @param j vertical coordinate of the cell
+/// @param stride distance between successive channels in "x"
 box get_region_box(float *x, float *biases, int n, int index, int i, int j, int w, int h, int stride)
 {
     box b;
@@ -83,6 +91,17 @@ box get_region_box(float *x, float *biases, int n, int index, int i, int j, int 
     return b;
 }
 
+/// set "delta" corresponding to selected bucket to ("scale" * diff between "x" and truth) (for each property of the bucket)
+/// @param x - last cnn layer output data
+/// @param biases - anchor boxes sizes (w0, h0, w1, h1, ...)
+/// @param n selected achnor box index
+/// @param index address of bucket in the "x" array (includes cell, batch, anchor)
+/// @param i horizontal coordinate of the cell
+/// @param j vertical coordinate of the cell
+/// @param w layer width (number of columns)
+/// @param delta delta array in the layer (output)
+/// @param scale ?
+/// @param stride distance between successive channels in "x"
 float delta_region_box(box truth, float *x, float *biases, int n, int index, int i, int j, int w, int h, float *delta, float scale, int stride)
 {
     box pred = get_region_box(x, biases, n, index, i, j, w, h, stride);
@@ -148,6 +167,7 @@ float tisnan(float x)
     return (x != x);
 }
 
+//convert index in array [anchor_index][y][x] into [anchor_index][property_index][y][x] where properties are (tx, ty, tw, th, p, classes...)
 int entry_index(layer l, int batch, int location, int entry)
 {
     int n =   location / (l.w*l.h);
@@ -187,16 +207,16 @@ void forward_region_layer(const layer l, network net)
 
     memset(l.delta, 0, l.outputs * l.batch * sizeof(float));
     if(!net.train) return;
-    float avg_iou = 0;
-    float recall = 0;
+    float avg_iou = 0; //average iou of all truth boxes with boxes from the bucket where it should be detected
+    float recall = 0; //number of truth boxes that have >0.5 iou with box from the bucket where it should be detected
     float avg_cat = 0;
     float avg_obj = 0;
     float avg_anyobj = 0;
-    int count = 0;
+    int count = 0; //total number of boxes in all images
     int class_count = 0;
     *(l.cost) = 0;
-    for (b = 0; b < l.batch; ++b) {
-        if(l.softmax_tree){
+    for (b = 0; b < l.batch; ++b) { //iterate through images in the batch
+        if(l.softmax_tree){ //false in our case (no tree=1 at yolo.cfg)
             int onlyclass = 0;
             for(t = 0; t < 30; ++t){
                 box truth = float_to_box(net.truth + t*(l.coords + 1) + b*l.truths, 1);
@@ -231,9 +251,11 @@ void forward_region_layer(const layer l, network net)
         }
         for (j = 0; j < l.h; ++j) {
             for (i = 0; i < l.w; ++i) {
-                for (n = 0; n < l.n; ++n) {
+                for (n = 0; n < l.n; ++n) { //(with 2 previous fors) iterate through all buckets
+                    //index of current bucket
                     int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
                     box pred = get_region_box(l.output, l.biases, n, box_index, i, j, l.w, l.h, l.w*l.h);
+                    //best iou of current bucket with all truth boxes
                     float best_iou = 0;
                     for(t = 0; t < 30; ++t){
                         box truth = float_to_box(net.truth + t*(l.coords + 1) + b*l.truths, 1);
@@ -262,12 +284,14 @@ void forward_region_layer(const layer l, network net)
                 }
             }
         }
-        for(t = 0; t < 30; ++t){
+        for(t = 0; t < 30; ++t){ //iterate through truth boxes in the image (max 30)
+            //ground truth: box to be detected
             box truth = float_to_box(net.truth + t*(l.coords + 1) + b*l.truths, 1);
 
             if(!truth.x) break;
-            float best_iou = 0;
-            int best_n = 0;
+            float best_iou = 0; //best iou of truth and anchor boxes
+            int best_n = 0; //index of the anchor for "best_iou"
+            //i,j - horizontal and vertical coordinates of the cell where center of the "truth" box is located
             i = (truth.x * l.w);
             j = (truth.y * l.h);
             //printf("%d %f %d %f\n", i, truth.x*l.w, j, truth.y*l.h);
@@ -275,16 +299,22 @@ void forward_region_layer(const layer l, network net)
             truth_shift.x = 0;
             truth_shift.y = 0;
             //printf("index %d %d\n",i, j);
-            for(n = 0; n < l.n; ++n){
+            for(n = 0; n < l.n; ++n){ //iterate through anchors
+                //address of cell of the center for current batch in layer "l" output
                 int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
+
+                //get a box computed by the network, but overwrite it in the following several lines
                 box pred = get_region_box(l.output, l.biases, n, box_index, i, j, l.w, l.h, l.w*l.h);
-                if(l.bias_match){
+                if(l.bias_match){ //true for yolo.cfg
                     pred.w = l.biases[2*n]/l.w;
                     pred.h = l.biases[2*n+1]/l.h;
                 }
                 //printf("pred: (%f, %f) %f x %f\n", pred.x, pred.y, pred.w, pred.h);
                 pred.x = 0;
                 pred.y = 0;
+                // now "pred" is (0, 0, anchor.w, anchor.h)
+
+                // iou of truth box and anchor when both shifted to (0,0)
                 float iou = box_iou(pred, truth_shift);
                 if (iou > best_iou){
                     best_iou = iou;
@@ -293,9 +323,13 @@ void forward_region_layer(const layer l, network net)
             }
             //printf("%d %f (%f, %f) %f x %f\n", best_n, best_iou, truth.x, truth.y, truth.w, truth.h);
 
+            /*
+             * fill l.delta for selected bucket
+             */
+            //address of bucket for current truth box in layer "l" output (best anchor, cell of the center, for current batch)
             int box_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, 0);
-            float iou = delta_region_box(truth, l.output, l.biases, best_n, box_index, i, j, l.w, l.h, l.delta, l.coord_scale *  (2 - truth.w*truth.h), l.w*l.h);
-            if(l.coords > 4){
+            float iou = delta_region_box(truth, l.output, l.biases, best_n, box_index, i, j, l.w, l.h, l.delta, l.coord_scale /*1*/ *  (2 - truth.w*truth.h), l.w*l.h);
+            if(l.coords /*4*/> 4){
                 int mask_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, 4);
                 delta_region_mask(net.truth + t*(l.coords + 1) + b*l.truths + 5, l.output, l.coords - 4, mask_index, l.delta, l.w*l.h, l.mask_scale);
             }
@@ -305,11 +339,11 @@ void forward_region_layer(const layer l, network net)
             //l.delta[best_index + 4] = iou - l.output[best_index + 4];
             int obj_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, l.coords);
             avg_obj += l.output[obj_index];
-            l.delta[obj_index] = l.object_scale * (1 - l.output[obj_index]);
-            if (l.rescore) {
+            l.delta[obj_index] = l.object_scale/*5*/ * (1 - l.output[obj_index]);
+            if (l.rescore/*1*/) {
                 l.delta[obj_index] = l.object_scale * (iou - l.output[obj_index]);
             }
-            if(l.background){
+            if(l.background/*0*/){
                 l.delta[obj_index] = l.object_scale * (0 - l.output[obj_index]);
             }
 

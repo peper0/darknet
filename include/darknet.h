@@ -127,8 +127,11 @@ struct layer{
     int nbiases;
     int extra;
     int truths;
+
+    // size of the output of the layer (height, width and channels)
     int h,w,c;
     int out_h, out_w, out_c;
+    // number of achor boxes? (at least in some contexts)
     int n;
     int max_boxes;
     int groups;
@@ -223,6 +226,7 @@ struct layer{
     float * weight_updates;
 
     float * delta;
+    //layout: [batch_index][channel][y][x], size: ...*c*h*w
     float * output;
     float * squared;
     float * norms;
@@ -412,6 +416,7 @@ typedef enum {
 typedef struct network{
     int n;
     int batch;
+    //how many images did the network see
     size_t *seen;
     int *t;
     float epoch;
@@ -491,6 +496,7 @@ typedef struct {
 } image;
 
 typedef struct{
+    //center and width and height as a fraction of image size (at least in some contexts)
     float x, y, w, h;
 } box;
 

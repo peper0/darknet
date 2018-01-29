@@ -1,0 +1,175 @@
+NOW:
+- zapamietywanie stanu optimizera - może zapisywać też model treningowy i dodać switcha do resetowania końcówki trenującej; sprawdzić, czy parametry optimizera się przywracają; sprawdzić, czy numer epoki da sie jakoś wyciągnąć z tego
+- gradient_stop - sprawdzić na małym przykładzie czy dobrze go rozumiem (przy okazji sprawdzić gradient tf.maximum)
+- magiczny współczynnik 2-area
+- jak ma sie suma kwadratów poszczególnych lossów (w yad2k) do darknetu?
+- oryginalny optimizer?
+- learning rate?
+- loss categorical crossentropy?
+
+
+Trenowanie darknetem:
+- bierzemy gotowy plik z wagami dla pierwszych 23 warstw (czyli przed-przedostatnia warstwa przez złączeniem z tą odnogą dla małych obiektów) "darknet19_448.conv.23". To, że plik jest dla 448 chyba nie ma znaczenia, bo tam wszystko jest konwolucyjne.
+
+
+
+Plan uczenia yad2k
+Uwagi ogólne:
+- uczenie zaczynamy od załadowania pełnego modelu; potem opcjonalnie ściągamy z niego górne warstwy (powyżej 23.)
+
+1. nauczenie od 0 dla jednej klasy
+- konwertujemy plik z wagami dla pierwszych 23 warstw lub więcej do modelu yolo; zdejmujemy warstwy ponad 23 (można rozważyć użycie funkcji create_model
+- budujemy model do trenowania (z warstwą loss)
+- trenujemy na podanym secie: katalog z obrazkami i carside plikami
+Co jeszcze:
+- ładowanie z dowolnego formatu (hdf5, jpg+txt, ...) - dla każdego formatu generator (coś jakby pluginy do ładowania danych)
+- warstwy konwolucyjne o dowolnej wielkości (--fully_convolutional w yad2k.py, ponoć nie działa z yolo2)
+- augumentacja
+- douczanie pozytywne (mamy obrazek, gdzie cos nie jest wykryte, a wiemy, że powinno)
+- douczanie negatywne (mamy obrazek, gdzie coś jest wykryte, a nie powinno)
+- możliwości z modelem wejściowym:
+  - podajemy model pełny, ale ściągamy warstwy ponad 23, a potem tworzymy własne
+  - podajemy pełny model, liczba klas musi się zgadzać
+
+  
+
+  
+
+Kod:
+main()
+  > run_detector()
+    > train_detector() @ detector.c
+      > load_network()
+        > parse_network_cfg()
+          > parse_net_options()
+            * tutaj jest wczytywanie ogólnych parametrów modelu (uczenie, wielkość batchy, etc.)
+          * tutaj jest wczytywanie warstw
+      * tutaj jest główna pętla  
+    \
+
+load_data_detection()
+  * tutaj ładowane są dane
+
+parse_region()
+  * parsowanie configa warstry tłumaczącej wyjście z cnn na bounding boxy
+forward_region_layer()
+  * liczenie funkcji straty
+
+    
+Terminologia (moja):
+mały batch - liczba obrazków ładowana pomiędzy kolejnymi zawołaniami train_network_datum(), forward_network(), backward_network(); równe net.batch
+duży batch - liczba obrazków ładowana pomiędzy kolejnymi zawołaniami update_network(); równe net.subdivisions małych batchy
+komórka - jeden "piksel" wyjściowej warsty sieci konwolucyjnej, odpowiata blokowi 32x32 piksele obrazu wejściowego
+pw, ph - szerokość i wysokość w pikselach
+aw, ah - wymiary w stosunku do anchora; aw=pw/anchor.pw
+tw, th - tw=log(aw); aw=exp(tw)
+px, py - położenie pikselowe wzglęgem lewego górnego rogu
+ix, iy - położenie jako frakcja odpowiedniego wymiaru obrazu, tj. współrzędne w zakresie [0,1); ix=px/image.pw
+cx, cy - cx=px/cell.pw (cx=1 to przesunięcie o jedną komórkę)
+tx, ty - simgoid(tx)=ax
+
+
+net.seen - ile obrazków już przeleciało (inkrementujemy o net.batch po każdym batchu)
+net.subdivisions - co tyle małych batchy (czyli co net.subdivisions*net.batch obrazków) robimy update_network()
+net.batch=64/8 (z yolo.cfg, ='batch'/'subdivisions') - tyle obrazków na raz ładujemy
+net.max_batches - ile dużych batchy ma pełny trening
+get_current_batch() - zwraca liczbę dużych batchy
+d.X.rows @ train_network() = args.n = net.batch * net.subdivisions * ngpus
+
+
+
+* w jednym cyklu ładujemy n = "batch" * "subdivisions" obrazków
+* co 10 dużych batchy losujemy rozmiar wejścia sieci, o ile opcja "random"==1
+    if current_batch < max_batches - 200:
+        net_input.w = net_input.h = rand_uniform(10, 19)*32
+    else: //ale dla ostatnich 200 batchy ustawiamy stały w zamierzeniu maksymalny
+        net_input.w = net_input.h = 608 //tak, zahardcodowane
+
+* losujemy n obrazków z całego zbioru
+* dla każdego z wylosowanych obrazków wykonujemy następujące operacje (wartości losowe są niezależne dla każdego obrazka):
+    * dane wejściowe
+        orig.w, orig.h = rozmiar obrazka wejściowego
+        jitter = opcja "jitter" z configa, =0.3 w yolo.cfg, =0.2 domyślnie
+
+    * maksymalna zmiana szerokości/wysokości do aspect ratio
+        dw = jitter * orig.w;
+        dh = jitter * orig.h;
+    
+    * losujemy nowe aspect ratio
+        new_ar = (orig.w + rand_uniform(-dw, dw)) / (orig.h + rand_uniform(-dh, dh));
+    
+    * losujemy współczynnik skalowania; oznacza on ile razy dłuższa krawędź obrazka po zmianie AR będzie większa od krawędzi wejścia do sieci (net_input.w, net_input.h)
+        scale = rand_uniform(.25, 2);
+
+    * wyznaczamy rozmiar obrazka na wejściu do sieci (każdy wymiar z osobna może być mniejszy lub większy niż wymiar wejścia)
+        if new_ar >= 1: //obrazek poziomy (po zmianie ar)
+            new.w = net_input.w * scale
+            new.h = new.w / new_ar
+        else:
+            new.h = scale * net_input.h
+            new.w = new_ar * new.h
+        
+    * losujemy przesunięcie w poziomie i pionie względem bazowego rogu (mogą być ujemne, jeśli scale>0
+        dx = rand_uniform(0, net_input.w - new.w);
+        dy = rand_uniform(0, net_input.h - new.h);
+    * na szarym (0.5 na każdym kanale) obrazku rysujemy wejściowy odpowiednio przeskalowany i przesunięty; używamy interpolacji dwuliniowej - nawet jeśli pomniejszamy obraz!
+    * w przestrzeni hsv wszystkie piksele mają skalowane s i v wg. poniższego wzoru (max_saturation to "saturation" z pliku konfiguracyjnego, w yolo.cfg oba mają wartość 1.5):
+            scale = rand_uniform(1, max_saturation);
+            if rand()%2:
+                saturation *= scale
+            else:
+                saturation /= scale;
+    * hue przesuwamy o wartość rand_uniform(-max_hue, max_hue)
+    * z prawdopodobieństwem 50% robimy lustrzane odbicie w poziomie
+    * wczytujemy labele (ground truth aka wzorcowe boxy) z pliku o nazwie otrzymywanej poprzez podmianę w nazwie obrazka: "images"->"labels", "JPEGImages"->"labels", "raw"->"labels", ".jpg"->".txt", ".png"->".txt"
+    * losowo zmieniamy kolejność wzorcowych boxów
+    * przekształcamy boxy geometrycznie, żeby odpowiadały przekształceniom obrazu wejściowego (przesunięcie i skalowanie w obu wymiarach)
+    
+* wyznaczanie lossa
+    * dla każdego wzorcowego boxa wyznaczamy kubełek do którego powinien wpaść (komórka odpowiadająca środkowi, anchor box najbliższy boxowi w metryce iou)
+      * dla tego kubełka wyznaczamy wzorcową wartość każdego parametru z (tx, ty, tw, th)
+      * jako deltę dla tych parametrów przyjmujemy różnicę wzorcowej od otrzymanej, wymnożoną przez magiczne scale=2-(truth.w*truth.h), czyli wartość pomiędzy 1 a 2 (1 dla dużych, 2 dla małych boxów)
+      * jako deltę dla parametru "detection" przyjmujemy (iou(network_out,wzorcowy_box)-layer.output.detection)*object_scale (gdzie "object_scale"=5 w yolo.cfg)
+      * z powyższego wynika, że najpierw uczymy sieć wyznaczać dobrze bounding boxy, a dopiero jak te boxy są w miarę ok, to uczymy ją mówić, że tam coś wykryła
+      * co ciekawe natomiast, dla wyznaczania klasy obiektu tego nie robimy
+    * dla pozostałych kubełków
+      * delty dla (tx, ty, tw i th):
+        * 0, jeśli widzieliśmy już więcej niż 12800 obrazków :)
+        * różnica względem danego parametru wyjściowego anchora skalowana przez 0.01
+        * z powyższego wynika, że jeśli w danym miejscu nic nie ma, to uczymy sieć zwracać tam wyjściowy anchor (ale bardzo delikatnie ją tego uczymy...)
+      * jako deltę dla parametru "detection" dla pozostałych kubełków, przyjmujemy:
+        * 0, jeśli iou boxa wyznaczonego przez dany kubełek z najlepszym truth boxem jest większe niż "thres" (=0.6 dla yolo.cfg)
+        * -noobject_scale*output w przeciwnym wypadku (gdzie "noobject_scale"=1 w yolo.cfg)
+    * delty dla tx i ty są liczone jako różnica wyjść sieci PO sigmoidowaniu (sigmoid(net.output)-true_relative_x)
+    * delty dla tw i th to różnica wyjść sieci (w dziedzinie logarytmicznej, tj. net_output - log(true_width/anchor_width))
+    
+    
+    * jakie funkcje aktywacji?
+    * jaki optymalizator?
+    * jakie lossy?
+    
+
+YAD2K:
+detekcja:
+keras.load_model + yolo_head + yolo_eval
+yolo_head: zamienia wyjście z sieci konwolucyjnej na tablice w których elementami są kandydaci na obiekty
+yolo_eval: non-max suppression na zwróconych kandydatach
+yolo_body: sieć konwolucyjna; używana tylko przy trenowaniu, normalnie wczytujemy ją z pliku .h5 (choć nie wiem czy zupełnie identyczną)
+get_detector_mask: wylicza coś jakby oczekiwane wyjście sieci, tj. maskę z 1 tylko w tym buckecie (aka detectorze) gdzie box powinien być wykryty, "adjusted box" czyli x,y względem lewego górnego rogu komórki, w,h=log(box_w/anchor_w),...
+    
+POMYSŁY:
+
+2-1
+4-2
+8-4
+16-4
+32-4
+64-4
+128-4
+
+próby:
+prostokąt bez wypełnienia
+znacznik na losowym tle (bez skali, a potem ze skalą)
++detekcja
+transformacja z tak jak w yolo (sigmoid?)
+transformacja w i h (exp)
